@@ -1,3 +1,5 @@
+#include "environment.hpp"
+#include "log/message-handler.hpp"
 #include "pid-file/pid-file.hpp"
 #include "services/clipboard/clipboard-server.hpp"
 #include <QtCore>
@@ -11,7 +13,8 @@
 #include <glaze/glaze.hpp>
 #include "data-control-clipboard-server.hpp"
 #include "common/common.hpp"
-#include "wayland/globals.hpp"
+#include <QtWaylandClient/QWaylandClientExtension>
+#include "qwayland-ext-data-control-v1.h"
 #include "common/clipboard-protocol.hpp"
 #include "common/clipboard-formats.hpp"
 
@@ -29,8 +32,19 @@ QString DataControlClipboardServer::id() const { return "data-control"; }
 
 int DataControlClipboardServer::activationPriority() const { return 1; }
 
+namespace {
+class DataControlManagerV1 : public QWaylandClientExtensionTemplate<DataControlManagerV1>,
+                             public QtWayland::ext_data_control_manager_v1 {
+public:
+  DataControlManagerV1() : QWaylandClientExtensionTemplate(1) { initialize(); }
+};
+} // namespace
+
 bool DataControlClipboardServer::isActivatable() const {
-  return Wayland::Globals::dataControlManager() != nullptr;
+  if (!Environment::isWaylandSession()) return false;
+
+  static DataControlManagerV1 manager;
+  return manager.isActive();
 }
 
 // Process must stay alive even when monitoring is off: it handles clipboard writes for snippets.
@@ -63,7 +77,9 @@ bool DataControlClipboardServer::start() {
 }
 
 void DataControlClipboardServer::handleReadError() {
-  QTextStream(stderr) << m_process.readAllStandardError();
+  for (const auto &line : m_process.readAllStandardError().trimmed().split('\n')) {
+    vicinae::log::subprocessLine(vicinae::log::CLIPBOARD_SERVER, {}, QString::fromUtf8(line));
+  }
 }
 
 void DataControlClipboardServer::handleRead() {
@@ -116,6 +132,19 @@ void DataControlClipboardServer::handleRead() {
 
             emit selectionAdded(cs);
           }
+        }
+      } else if (tag == clipboard_proto::Command::PrimarySelectionNotification) {
+        clipboard_proto::Selection selection;
+
+        if (auto err = glz::read_beve(selection, payload)) {
+          qWarning() << "Failed to parse primary selection";
+        } else {
+          QString text;
+          if (!selection.offers.empty()) {
+            const auto &data = selection.offers.front().data;
+            text = QString::fromUtf8(reinterpret_cast<const char *>(data.data()), data.size());
+          }
+          emit primarySelectionChanged(text);
         }
       } else {
         qWarning() << "Unknown command tag from data-control-server:" << static_cast<int>(tag);

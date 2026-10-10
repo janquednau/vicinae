@@ -1,8 +1,7 @@
 #include "extension-action-panel-builder.hpp"
 #include "extension-action-list-view.hpp"
-#include "common-actions.hpp"
-#include "qml/shortcut-form-view-host.hpp"
-#include "ui/action-pannel/action.hpp"
+#include "actions/shortcut-actions.hpp"
+#include "ui/action-panel/action.hpp"
 #include "ui/image/url.hpp"
 #include <qjsonobject.h>
 
@@ -27,18 +26,17 @@ static AbstractAction *createActionFromModel(const ActionModel &model, const Not
       if (iconValue.isString()) { icon = iconValue.toString(); }
     }
 
-    auto view = new ShortcutFormViewHost();
-    view->setPrefilledValues(link, name, application, icon);
     ImageURL actionIcon;
 
     if (model.icon) {
       actionIcon = ImageURL(*model.icon);
     } else {
-      actionIcon = ImageURL::builtin("link");
+      actionIcon = ImageURL::builtin(BuiltinIcon::Link);
     }
 
     auto qTitle = QString::fromStdString(model.title);
-    auto action = new PushViewAction(qTitle, view, actionIcon);
+    auto action = new CreateShortcutAction({.link = link, .name = name, .app = application, .icon = icon},
+                                           qTitle, actionIcon);
     if (model.stableId) { action->setId(QString::fromStdString(*model.stableId)); }
     return action;
   }

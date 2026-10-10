@@ -27,6 +27,7 @@
 #include "utils/scoped-com.hpp"
 
 #include <QDebug>
+#include <QFileInfo>
 #include <array>
 #include <chrono>
 #include <string>
@@ -403,6 +404,13 @@ std::optional<fs::path> defaultHandlerExe(const std::wstring &assoc) {
   return assocQueryString(ASSOCSTR_EXECUTABLE, assoc);
 }
 
+// A scheme is registered when HKCR\<scheme> carries a "URL Protocol" value, UWP handlers included.
+bool isRegisteredProtocol(const std::wstring &scheme) {
+  DWORD size = 0;
+  return RegGetValueW(HKEY_CLASSES_ROOT, scheme.c_str(), L"URL Protocol", RRF_RT_ANY, nullptr, nullptr,
+                      &size) == ERROR_SUCCESS;
+}
+
 std::vector<std::pair<fs::path, QString>> enumExtensionHandlers(const std::wstring &ext,
                                                                 ASSOC_FILTER filter) {
   std::vector<std::pair<fs::path, QString>> result;
@@ -528,6 +536,27 @@ std::optional<fs::path> searchExecutable(const wchar_t *name) {
   return std::nullopt;
 }
 
+std::optional<fs::path> explorerPath() {
+  if (auto windir = envPath(L"WINDIR")) return *windir / L"explorer.exe";
+  return searchExecutable(L"explorer.exe");
+}
+
+bool isExplorer(const fs::path &exe) { return _wcsicmp(exe.filename().c_str(), L"explorer.exe") == 0; }
+
+struct DirectoryHandler {
+  fs::path exe;
+  std::wstring assoc;
+};
+
+// Replacement file managers register themselves as the default verb of the Directory class
+// (or of the broader Folder class). Windows has no dedicated "default file manager" setting.
+std::optional<DirectoryHandler> defaultDirectoryHandler() {
+  for (const auto *assoc : {L"Directory", L"Folder"}) {
+    if (auto exe = defaultHandlerExe(assoc)) return DirectoryHandler{std::move(*exe), assoc};
+  }
+  return std::nullopt;
+}
+
 } // namespace
 
 struct UwpPackageWatcher {
@@ -540,7 +569,7 @@ struct UwpPackageWatcher {
 WindowsAppDatabase::WindowsAppDatabase() {
   connect(&m_watcher, &QFileSystemWatcher::directoryChanged, this, [this] { Q_EMIT changed(); });
 
-  scan(defaultSearchPaths());
+  scan();
 
   m_rescanTimer.setInterval(APP_PATHS_RESCAN_INTERVAL);
   connect(&m_rescanTimer, &QTimer::timeout, this, [this] { Q_EMIT changed(); });
@@ -575,13 +604,39 @@ std::vector<fs::path> WindowsAppDatabase::defaultSearchPaths() const {
   return paths;
 }
 
+std::vector<fs::path> WindowsAppDatabase::searchPaths() const {
+  std::vector<fs::path> paths = m_extraSearchPaths;
+  auto defaults = defaultSearchPaths();
+  paths.insert(paths.end(), defaults.begin(), defaults.end());
+  return paths;
+}
+
 void WindowsAppDatabase::addApp(std::shared_ptr<WindowsApplication> app) {
   if (!app || m_appsById.contains(app->id())) return;
   for (const auto &action : app->actions()) {
     m_appsById.emplace(action->id(), std::static_pointer_cast<WindowsApplication>(action));
   }
   m_appsById.emplace(app->id(), app);
+  indexAliases(app);
   m_apps.emplace_back(std::move(app));
+}
+
+void WindowsAppDatabase::indexAliases(const std::shared_ptr<WindowsApplication> &app) {
+  auto add = [&](const QString &alias) {
+    if (!alias.isEmpty()) m_appsByAlias.try_emplace(alias.toLower(), app);
+  };
+  match(
+      app->kind(),
+      [&](const Win32ShortcutApp &s) {
+        add(s.aumid);
+        add(s.program);
+        add(QFileInfo(s.program).fileName());
+      },
+      [&](const Win32ExeApp &e) {
+        add(toQString(e.exe));
+        add(toQString(e.exe.filename()));
+      },
+      [&](const PackagedApp &p) { add(p.aumid); }, [](const auto &) {});
 }
 
 void WindowsAppDatabase::addShortcut(const fs::path &file) {
@@ -673,24 +728,65 @@ void WindowsAppDatabase::scanAppPaths() {
   fs::path windowsApps; // packaged apps register execution aliases here; scanUwp already lists them
   if (auto programFiles = envPath(L"ProgramW6432")) windowsApps = *programFiles / L"WindowsApps";
 
-  for (const auto &exe : enumerateAppPaths()) {
+  for (const auto &rawExe : enumerateAppPaths()) {
+    const fs::path exe = rawExe.lexically_normal();
     std::error_code ec;
     if (!fs::exists(exe, ec) || looksLikeUninstaller(exe)) continue;
     if (!systemRoot.empty() && isUnderDirectory(exe, systemRoot)) continue;
     if (!windowsApps.empty() && isUnderDirectory(exe, windowsApps)) continue;
+    // already reachable through a Start Menu or desktop shortcut
+    if (m_appsByAlias.contains(toQString(exe).toLower())) continue;
 
     // nameless exes are almost always helper binaries
     const QString description = exeFileDescription(exe);
     if (description.isEmpty()) continue;
 
-    Win32ExeApp exeApp{exe};
+    addExecutable(exe, description);
+  }
+}
 
-    WindowsApplication::Data data;
-    data.id = appId(exeApp);
-    data.displayName = description;
-    data.kind = std::move(exeApp);
+void WindowsAppDatabase::addExecutable(const fs::path &exe, const QString &name, const QString &category) {
+  Win32ExeApp exeApp{exe};
 
-    addApp(std::make_shared<WindowsApplication>(std::move(data)));
+  WindowsApplication::Data data;
+  data.id = appId(exeApp);
+  data.displayName = name;
+  data.category = category;
+  data.kind = std::move(exeApp);
+
+  addApp(std::make_shared<WindowsApplication>(std::move(data)));
+}
+
+void WindowsAppDatabase::scanPortable() {
+  for (const auto &root : m_extraSearchPaths) {
+    std::error_code ec;
+    if (!fs::is_directory(root, ec)) continue;
+
+    m_watchDirs.insert(toQString(root));
+
+    fs::directory_iterator it(root, fs::directory_options::skip_permission_denied, ec);
+    const fs::directory_iterator end;
+    if (ec) continue;
+
+    for (; it != end; it.increment(ec)) {
+      if (ec) {
+        ec.clear();
+        continue;
+      }
+      if (!it->is_regular_file(ec)) continue;
+
+      const fs::path &file = it->path();
+      if (lowerExtension(file) != L".exe") {
+        addShortcut(file);
+        continue;
+      }
+      // already reachable through a shortcut or an App Paths entry
+      if (looksLikeUninstaller(file) || m_appsByAlias.contains(toQString(file).toLower())) continue;
+
+      const QString description = exeFileDescription(file);
+      addExecutable(file, description.isEmpty() ? toQString(file.stem()) : description,
+                    QStringLiteral("Portable"));
+    }
   }
 }
 
@@ -755,16 +851,18 @@ void WindowsAppDatabase::refreshUwpCache() {
   }
 }
 
-bool WindowsAppDatabase::scan(const std::vector<fs::path> &paths) {
+bool WindowsAppDatabase::scan() {
   m_apps.clear();
   m_appsById.clear();
+  m_appsByAlias.clear();
   m_watchDirs.clear();
 
   ScopedCom com;
   scanUwp(); // first: addShortcut drops shortcuts whose AUMID is already listed
-  scanWin32(paths);
+  scanWin32(defaultSearchPaths());
   scanDesktop();
   scanAppPaths();
+  scanPortable(); // last: dedupes against everything above
 
   installWatches();
   return !m_apps.empty();
@@ -860,6 +958,18 @@ bool WindowsAppDatabase::launch(const AbstractApplication &app, const std::vecto
       });
 }
 
+// -EncodedCommand sidesteps powershell's command-line quoting entirely
+std::unique_ptr<QProcess> WindowsAppDatabase::shellProcess(const QString &code) const {
+  const fs::path shell = searchExecutable(L"pwsh.exe").value_or(L"powershell.exe");
+  const QByteArray utf16(reinterpret_cast<const char *>(code.utf16()), code.size() * 2);
+
+  auto proc = std::make_unique<QProcess>();
+  proc->setProgram(toQString(shell));
+  proc->setArguments({QStringLiteral("-NoProfile"), QStringLiteral("-NonInteractive"),
+                      QStringLiteral("-EncodedCommand"), QString::fromLatin1(utf16.toBase64())});
+  return proc;
+}
+
 bool WindowsAppDatabase::launchTerminalCommand(const std::vector<QString> &cmdline,
                                                const LaunchTerminalCommandOptions &opts) const {
   if (cmdline.empty()) return false;
@@ -951,6 +1061,7 @@ WindowsAppDatabase::AppPtr WindowsAppDatabase::findDefaultOpener(const Target &t
   const auto assoc = classifyTarget(target);
   if (!assoc) return nullptr;
   if (assoc->kind == AssocKind::Directory) return fileBrowser();
+  if (assoc->kind == AssocKind::Protocol && !isRegisteredProtocol(assoc->value)) return nullptr;
 
   ScopedCom com;
   if (auto exe = defaultHandlerExe(assoc->value))
@@ -967,19 +1078,34 @@ std::vector<WindowsAppDatabase::AppPtr> WindowsAppDatabase::list() const {
   return {m_apps.begin(), m_apps.end()};
 }
 
-WindowsAppDatabase::AppPtr WindowsAppDatabase::findByClass(const QString &) const { return nullptr; }
+WindowsAppDatabase::AppPtr WindowsAppDatabase::findByClass(const QString &name) const {
+  if (auto it = m_appsByAlias.find(name.toLower()); it != m_appsByAlias.end()) return it->second;
+  return nullptr;
+}
+
+void WindowsAppDatabase::applyPreferences(const AppPreferences &preferences) {
+  std::vector<fs::path> extra;
+
+  extra.reserve(preferences.paths.size());
+  for (const auto &path : preferences.paths) {
+    if (!path.empty()) {
+      extra.emplace_back(fs::path(QString::fromStdString(path).toStdWString()).lexically_normal());
+    }
+  }
+
+  if (extra == m_extraSearchPaths) return;
+  m_extraSearchPaths = std::move(extra);
+  emit changed();
+}
 
 WindowsAppDatabase::AppPtr WindowsAppDatabase::fileBrowser() const {
   ScopedCom com;
-  fs::path explorer;
-  if (auto windir = envPath(L"WINDIR")) {
-    explorer = *windir / L"explorer.exe";
-  } else if (auto found = searchExecutable(L"explorer.exe")) {
-    explorer = *found;
-  } else {
-    return nullptr;
+  if (auto handler = defaultDirectoryHandler(); handler && !isExplorer(handler->exe)) {
+    return resolveExecutable(handler->exe, friendlyAppName(handler->assoc),
+                             QString::fromStdWString(handler->assoc));
   }
-  return appForExecutable(explorer, QStringLiteral("File Explorer"));
+  if (auto explorer = explorerPath()) return appForExecutable(*explorer, tr("File Explorer"));
+  return nullptr;
 }
 
 WindowsAppDatabase::AppPtr WindowsAppDatabase::genericTextEditor() const {
@@ -998,9 +1124,9 @@ WindowsAppDatabase::AppPtr WindowsAppDatabase::webBrowser() const {
 WindowsAppDatabase::AppPtr WindowsAppDatabase::terminalEmulator() const {
   ScopedCom com;
   if (!defaultTerminalIsConhost()) {
-    if (auto wt = searchExecutable(L"wt.exe")) return appForExecutable(*wt, QStringLiteral("Terminal"));
+    if (auto wt = searchExecutable(L"wt.exe")) return appForExecutable(*wt, tr("Terminal"));
   }
-  return appForExecutable(envPath(L"ComSpec").value_or(L"cmd.exe"), QStringLiteral("Command Prompt"));
+  return appForExecutable(envPath(L"ComSpec").value_or(L"cmd.exe"), tr("Command Prompt"));
 }
 
 bool WindowsAppDatabase::showInFileBrowser(const fs::path &path, bool select) const {
@@ -1017,10 +1143,15 @@ bool WindowsAppDatabase::showInFileBrowser(const fs::path &path, bool select) co
   ScopedCom com;
 
   if (reveal) {
-    const std::wstring params = L"/select,\"" + target.wstring() + L"\"";
-    return shellExecuteOpen(L"explorer.exe", params.c_str());
+    if (auto handler = defaultDirectoryHandler(); !handler || isExplorer(handler->exe)) {
+      const std::wstring params = L"/select,\"" + target.wstring() + L"\"";
+      return shellExecuteOpen(L"explorer.exe", params.c_str());
+    }
+    // only Explorer understands /select: a replacement file manager gets the containing folder
+    if (const fs::path parent = target.parent_path(); !parent.empty()) target = parent;
   }
 
+  // the shell resolves the Directory association itself, so the user's file manager is honored
   return shellExecuteOpen(target.wstring());
 }
 

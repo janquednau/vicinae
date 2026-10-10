@@ -78,6 +78,8 @@ export class RpcTransport {
 	private handlers = new Map<string, Array<(result: any) => void>>;
 };
 
+export type DMenuOutputFormat = 'Data' | 'Index';
+
 export type PingResponse = {
 	version: string;
 	pid: number;
@@ -107,10 +109,31 @@ export type LaunchAppResponse = {
 	focusedWindowTitle: string;
 }
 
+export type LaunchCommandRequest = {
+	entrypoint: string;
+	args: string[];
+	cwd?: string;
+	query?: string;
+}
+
+export type LaunchCommandResponse = {
+	error?: string;
+}
+
+export type CommandInfo = {
+	id: string;
+	name: string;
+}
+
+export type ListCommandsResponse = {
+	commands: CommandInfo[];
+}
+
 export type DMenuRequest = {
 	rawContent: string;
 	navigationTitle?: string;
 	placeholder?: string;
+	format: DMenuOutputFormat;
 	sectionTitle?: string;
 	noSection: boolean;
 	noQuickLook: boolean;
@@ -120,6 +143,7 @@ export type DMenuRequest = {
 	width?: number;
 	height?: number;
 	noFooter: boolean;
+	password: boolean;
 }
 
 export type DMenuResponse = {
@@ -140,6 +164,8 @@ export type BrowserTabInfo = {
 	active: boolean;
 	muted: boolean;
 	audible: boolean;
+	lastAccessed: number;
+	pinned: boolean;
 }
 
 export type FocusTabRequest = {
@@ -179,6 +205,14 @@ class IpcService {
 
 	launchApp(req: LaunchAppRequest): Promise<LaunchAppResponse> {
 		return this.transport.request("Ipc/launchApp", { req});	
+	}
+
+	listCommands(): Promise<ListCommandsResponse> {
+		return this.transport.request("Ipc/listCommands", { });	
+	}
+
+	launchCommand(req: LaunchCommandRequest): Promise<LaunchCommandResponse> {
+		return this.transport.request("Ipc/launchCommand", { req});	
 	}
 
 	dmenu(req: DMenuRequest): Promise<DMenuResponse> {

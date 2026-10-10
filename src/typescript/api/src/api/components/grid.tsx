@@ -5,6 +5,8 @@ import { EmptyView } from "./empty-view";
 import { type ColorLike, serializeColorLike } from "../color";
 import { Dropdown } from "./dropdown";
 import { useEventCounted } from "../hooks/use-event-counted";
+import { usePagination } from "./pagination";
+import { Clipboard } from "../clipboard";
 
 enum GridInset {
 	Zero = "zero",
@@ -114,6 +116,11 @@ export namespace Grid {
 		searchBarAccessory?: ReactNode;
 		onSearchTextChange?: (text: string) => void;
 		onSelectionChange?: (id: string) => void;
+
+		pagination?: {
+			onLoadMore: () => Promise<void> | void;
+			hasMore: boolean;
+		};
 	};
 
 	/**
@@ -162,6 +169,8 @@ export namespace Grid {
 			id?: string;
 			subtitle?: string;
 			actions?: ReactNode;
+			/** Content transferred when this item is dragged. */
+			dragContent?: Clipboard.Content;
 			accessory?: Grid.Item.Accessory;
 		};
 
@@ -205,8 +214,12 @@ const GridRoot: React.FC<Grid.Props> = ({
 		onSearchTextChange,
 	);
 
+	const pagination = usePagination(props.pagination);
+
 	return (
 		<grid
+			paginationHasMore={pagination?.hasMore ?? false}
+			paginationOnLoadMore={pagination?.onLoadMore}
 			fit={fit}
 			throttle={throttle}
 			inset={inset}
@@ -225,11 +238,14 @@ const GridRoot: React.FC<Grid.Props> = ({
 const GridItem: React.FC<Grid.Item.Props> = ({
 	detail,
 	actions,
+	dragContent,
 	content,
 	accessory,
+	id: propsId,
 	...props
 }) => {
-	const id = useRef(props.id ?? randomUUID());
+	const generatedId = useRef(randomUUID());
+	const id = propsId ?? generatedId.current;
 
 	// Remove value wrapper
 	const innerContent =
@@ -270,9 +286,12 @@ const GridItem: React.FC<Grid.Item.Props> = ({
 		<grid-item
 			{...props}
 			content={serializedContent}
+			dragContent={
+				dragContent ? Clipboard.serializeContent(dragContent) : undefined
+			}
 			tooltip={tooltip}
 			accessory={serializedAccessory}
-			id={id.current}
+			id={id}
 		>
 			{detail}
 			{actions}

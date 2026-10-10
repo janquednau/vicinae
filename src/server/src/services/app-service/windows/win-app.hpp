@@ -1,4 +1,5 @@
 #pragma once
+#include <QCoreApplication>
 #include "common/types.hpp"
 #include "services/app-service/abstract-app-db.hpp"
 #include "ui/image/url.hpp"
@@ -37,6 +38,8 @@ struct ShellOpenApp {
 using WindowsAppKind = std::variant<Win32ShortcutApp, UrlShortcutApp, Win32ExeApp, PackagedApp, ShellOpenApp>;
 
 class WindowsApplication : public AbstractApplication {
+  Q_DECLARE_TR_FUNCTIONS(WindowsApplication)
+
 public:
   struct Data {
     QString id;
@@ -57,6 +60,7 @@ public:
   bool displayable() const override { return true; }
   bool isTerminalApp() const override { return false; }
   bool isAction() const override { return m_data.elevated; }
+  bool isOpener() override { return !m_data.elevated; }
   QString description() const override { return {}; }
   QString category() const override { return m_data.category; }
 
@@ -64,10 +68,22 @@ public:
     if (m_data.elevated || !supportsElevation()) return {};
     Data data = m_data;
     data.id += QStringLiteral(":runas");
-    data.fullyQualifiedName = m_data.displayName + QStringLiteral(": Run as Administrator");
-    data.displayName = QStringLiteral("Run as Administrator");
+    data.fullyQualifiedName = tr("%1: Run as Administrator").arg(m_data.displayName);
+    data.displayName = tr("Run as Administrator");
     data.elevated = true;
     return {std::make_shared<WindowsApplication>(std::move(data))};
+  }
+
+  // matches the keys produced by the window manager: full exe paths and AUMIDs
+  bool matchesWindowClass(const QString &target) const override {
+    if (target.isEmpty()) return false;
+    auto equals = [&](const QString &value) {
+      return !value.isEmpty() && value.compare(target, Qt::CaseInsensitive) == 0;
+    };
+    return match(
+        m_data.kind, [&](const Win32ShortcutApp &s) { return equals(s.aumid) || equals(s.program); },
+        [&](const Win32ExeApp &e) { return equals(QString::fromStdWString(e.exe.wstring())); },
+        [&](const PackagedApp &p) { return equals(p.aumid); }, [](const auto &) { return false; });
   }
 
   QString program() const override {

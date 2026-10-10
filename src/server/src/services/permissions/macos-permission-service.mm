@@ -1,10 +1,10 @@
 #include "macos-permission-service.hpp"
+#import <AppKit/AppKit.h>
 #include <ApplicationServices/ApplicationServices.h>
+#import <UserNotifications/UserNotifications.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <QPointer>
-#import <AppKit/AppKit.h>
-#import <UserNotifications/UserNotifications.h>
 
 namespace {
 
@@ -34,9 +34,7 @@ bool probeFullDiskAccess() {
   return false;
 }
 
-void openPane(const char *url) {
-  [NSWorkspace.sharedWorkspace openURL:[NSURL URLWithString:@(url)]];
-}
+void openPane(const char *url) { [NSWorkspace.sharedWorkspace openURL:[NSURL URLWithString:@(url)]]; }
 
 } // namespace
 
@@ -48,6 +46,8 @@ MacosPermissionService::MacosPermissionService(QObject *parent) : QObject(parent
   connect(&m_pollTimer, &QTimer::timeout, this, &MacosPermissionService::refresh);
   refreshNotifications();
 }
+
+bool MacosPermissionService::supported() const { return true; }
 
 void MacosPermissionService::setWatching(bool value) {
   if (value == m_pollTimer.isActive()) return;
@@ -62,9 +62,8 @@ void MacosPermissionService::setWatching(bool value) {
 void MacosPermissionService::requestAccessibility() {
   const void *keys[] = {kAXTrustedCheckOptionPrompt};
   const void *values[] = {kCFBooleanTrue};
-  CFDictionaryRef options =
-      CFDictionaryCreate(kCFAllocatorDefault, keys, values, 1, &kCFTypeDictionaryKeyCallBacks,
-                         &kCFTypeDictionaryValueCallBacks);
+  CFDictionaryRef options = CFDictionaryCreate(
+      kCFAllocatorDefault, keys, values, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
   AXIsProcessTrustedWithOptions(options);
   CFRelease(options);
 
@@ -89,9 +88,9 @@ void MacosPermissionService::requestNotifications() {
     return;
   }
 
-  NSString *url =
-      [NSString stringWithFormat:@"x-apple.systempreferences:com.apple.Notifications-Settings.extension?id=%@",
-                                 NSBundle.mainBundle.bundleIdentifier];
+  NSString *url = [NSString
+      stringWithFormat:@"x-apple.systempreferences:com.apple.Notifications-Settings.extension?id=%@",
+                       NSBundle.mainBundle.bundleIdentifier];
   [NSWorkspace.sharedWorkspace openURL:[NSURL URLWithString:url]];
 }
 

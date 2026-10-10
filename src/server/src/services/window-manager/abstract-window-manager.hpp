@@ -5,7 +5,6 @@
 #include <qobject.h>
 #include <qpromise.h>
 #include <qstringview.h>
-#include "services/app-service/abstract-app-db.hpp"
 #include <QGuiApplication>
 #include <QScreen>
 #include <QWindow>
@@ -31,6 +30,18 @@ signals:
   void focusChanged() const;
 
 public:
+  enum class Capability {
+    Fullscreen = 1,
+    Minimize = 1 << 1,
+    ToggleFloating = 1 << 2,
+    ToggleOverview = 1 << 3,
+    SetSticky = 1 << 4
+  };
+
+  /**
+   * Window geometry in Qt logical coordinates, composable with `Screen::bounds`.
+   * The X11 backend currently reports raw native pixels instead.
+   */
   struct WindowBounds {
     int32_t x = 0;
     int32_t y = 0;
@@ -61,11 +72,6 @@ public:
      * is not shown.
      */
     bool active = false;
-  };
-
-  struct BlurConfig {
-    bool enabled = true;
-    int rounding = 0;
   };
 
   /**
@@ -99,7 +105,12 @@ public:
 
     virtual QString id() const = 0;
     virtual QString name() const { return id(); }
-    virtual QString monitor() const = 0;
+
+    /**
+     * The monitor this workspace belongs to. Workspaces that span all monitors (Windows virtual
+     * desktops, X11 desktops) return nullopt.
+     */
+    virtual std::optional<QString> monitor() const { return std::nullopt; }
     virtual bool hasFullScreen() const { return false; }
   };
 
@@ -153,6 +164,14 @@ public:
   virtual std::shared_ptr<AbstractWindow> getFocusedWindowSync() const { return nullptr; }
 
   /**
+   * The most recently focused window on the active workspace, ignoring layer shell surfaces and the
+   * launcher's own windows. Only consulted when `supportsFrontmostWindow` returns true.
+   */
+  virtual std::shared_ptr<AbstractWindow> getFrontmostWindowSync() const { return nullptr; }
+
+  virtual bool supportsFrontmostWindow() const { return false; }
+
+  /**
    * Whether the window manager is able to track what window is currently focused.
    * Note that a WM implementation can still implement `focusWindowSync` even if it
    * can't track the currently focused window.
@@ -164,14 +183,20 @@ public:
   virtual bool supportsFocusTracking() const { return false; }
 
   /**
-   * Whether `getFocusedWindowSync` returns nullptr when a layer shell surface grabs keyboard focus.
-   * Some compositors (niri, gnome) null out the focused window when a layer has focus, making it
-   * possible to detect focus transitions. Others (hyprland) keep reporting the previously focused
-   * window, in which case we cannot reliably detect when focus has returned to the target app.
+   * Whether `getFocusedWindowSync` reliably reflects the launcher losing focus: while the launcher
+   * holds focus it reports either nullptr or the launcher's own window, so consumers can poll for
+   * the moment focus lands on the target app. Some wayland compositors (hyprland) keep reporting
+   * the previously focused window while a layer shell surface has focus, making this impossible.
    */
-  virtual bool focusNullsOnLayerGrab() const { return false; }
+  virtual bool supportsFocusHandoffDetection() const { return false; }
 
   virtual void focusWindowSync(const AbstractWindow &window) const {}
+
+  virtual void focusWorkspaceSync(const AbstractWorkspace &workspace) const {}
+
+  virtual QFlags<Capability> capabilities() const { return {}; }
+
+  bool supports(Capability cap) const { return capabilities().testFlag(cap); }
 
   /**
    * Refresh the window list. No-op by default; poll-based implementations re-scan, event-driven ones that
@@ -214,15 +239,36 @@ public:
    */
   virtual bool closeWindow(const AbstractWindow &window) const { return false; }
 
+  virtual bool supportsSetSticky() const { return false; }
   virtual bool setSticky(const AbstractWindow &window, bool sticky) const { return false; }
 
   virtual bool setWindowBounds(const AbstractWindow &window, const WindowBounds &bounds) const {
     return false;
   }
 
+  virtual bool supportsMoveToWorkspace() const { return false; }
   virtual bool moveToWorkspace(const AbstractWindow &window, const QString &workspaceId) const {
     return false;
   }
+
+  /**
+   * Switch the active workspace, without moving any window.
+   */
+  virtual bool supportsWorkspaceActivation() const { return false; }
+  virtual bool activateWorkspace(const QString &workspaceId) const { return false; }
+
+  virtual bool toggleFullscreen(const AbstractWindow &window) { return false; }
+
+  /**
+   * Toggle the target window from tiling to floating and vice-versa.
+   * This mostly applies to tiling/scrolling WMs.
+   */
+  virtual bool toggleFloating(const AbstractWindow &window) { return false; }
+
+  /**
+   * Toggle the "overview" mode of the desktop, if supported.
+   */
+  virtual bool toggleOverview() { return false; }
 
   /**
    * To make sure the window manager IPC link is healthy.

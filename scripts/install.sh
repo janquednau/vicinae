@@ -11,12 +11,23 @@ SYSTEMD_SERVICE_NAME="vicinae.service"
 # Installation prefix - can be overridden via environment or --prefix flag
 PREFIX="${PREFIX:-/usr/local}"
 
+# systemd searches a fixed set of user unit directories. "$PREFIX/lib/systemd/user"
+# is one of them for /usr and /usr/local, but not for a prefix under $HOME, where
+# the XDG data directory is the one it looks at.
+resolve_systemd_user_dir() {
+	if [[ "$PREFIX" == "$HOME" || "$PREFIX" == "$HOME"/* ]]; then
+		echo "${XDG_DATA_HOME:-$HOME/.local/share}/systemd/user"
+	else
+		echo "$PREFIX/lib/systemd/user"
+	fi
+}
+
 # Derived paths based on PREFIX
 INSTALL_DIR="$PREFIX/lib/vicinae"
 BIN_DIR="$PREFIX/bin"
 THEMES_DIR="$PREFIX/share/vicinae/themes"
 APPLICATIONS_DIR="$PREFIX/share/applications"
-SYSTEMD_USER_DIR="$PREFIX/lib/systemd/user"
+SYSTEMD_USER_DIR="$(resolve_systemd_user_dir)"
 
 VICINAE_SCRIPT_PATH="$TEMP_DIR/vicinae-install-script.sh"
 SCRIPT_DOWNLOAD_URL="https://vicinae.com/install"
@@ -145,7 +156,7 @@ check_permissions() {
 				exit 0
 			fi
 
-			echo "Re-downloading script to execute with elevated privileges..."
+			echo "Preparing script to execute with elevated privileges..."
 			self_download
 			
 			# Re-execute with privilege escalation
@@ -163,7 +174,11 @@ get_latest_release_info() {
 	local api_url="https://api.github.com/repos/$REPO/releases/latest"
 
 	local response
-	response=$(curl -s "$api_url")
+	if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+		response=$(curl -s --header "Authorization: Bearer $GITHUB_TOKEN" "$api_url")
+	else
+		response=$(curl -s "$api_url")
+	fi
 
 	local tag_name
 	tag_name=$(echo "$response" | jq -r '.tag_name')
@@ -263,8 +278,15 @@ download_appimage() {
 	fi
 }
 
+# AppImages may ship directories without group/other access (#2039), which
+# breaks a root install for every regular user
+fix_permissions() {
+	chmod -R u=rwX,go=rX "$1"
+}
+
 extract_appimage() {
 	local appimage_path="$1"
+	local keep_appimage="${2:-}"
 	local extract_dir="$INSTALL_DIR.extract"
 	local extract_logs="$TEMP_DIR/appimage-extract.log" 
 
@@ -284,10 +306,13 @@ extract_appimage() {
 		if [[ -d "squashfs-root" ]]; then
 			mv squashfs-root/* squashfs-root/.[!.]* . 2>/dev/null || true
 			rmdir squashfs-root 2>/dev/null || rm -rf squashfs-root
+			fix_permissions "$extract_dir"
 			ok "Extraction completed"
 			echo "$extract_dir"
 			rm $extract_logs
-			rm $appimage_path
+			if [[ -z "$keep_appimage" ]]; then
+				rm "$appimage_path"
+			fi
 		else
 			echo "Error: squashfs-root directory not found after extraction" >&2
 			ls -la >&2
@@ -586,12 +611,15 @@ show_usage() {
 	echo "Usage: $0 [OPTIONS]"
 	echo ""
 	echo "Options:"
-	echo "  --prefix PATH  Installation prefix (default: /usr/local)"
-	echo "  --uninstall    Uninstall Vicinae"
-	echo "  --help, -h     Show this help message"
+	echo "  --prefix PATH    Installation prefix (default: /usr/local)"
+	echo "  --appimage PATH  Install from a local AppImage instead of downloading the latest release"
+	echo "  --token TOKEN    GitHub token for the release API call (avoids rate limiting)"
+	echo "  --uninstall      Uninstall Vicinae"
+	echo "  --help, -h       Show this help message"
 	echo ""
 	echo "Environment variables:"
 	echo "  PREFIX         Installation prefix (overridden by --prefix)"
+	echo "  GITHUB_TOKEN   GitHub token for the release API call (overridden by --token)"
 	echo ""
 	echo "Without options, the script will install or update Vicinae to the latest version."
 	echo ""
@@ -599,11 +627,17 @@ show_usage() {
 	echo "  $0                           # Install to /usr/local (requires sudo)"
 	echo "  $0 --prefix ~/.local         # Install to ~/.local (user install)"
 	echo "  PREFIX=/opt/vicinae $0       # Install to /opt/vicinae"
+	echo "  GITHUB_TOKEN=ghp_xxx $0      # Use a GitHub token (avoids API rate limiting)"
 }
 
-# we need to download the script and store it on disk to re-execute it with privilege elevation, if needed
+# we need the script stored on disk to re-execute it with privilege elevation, if needed.
+# when piped from curl there is no file to copy, so we download it again
 self_download() {
-	curl -fsSL $SCRIPT_DOWNLOAD_URL > $VICINAE_SCRIPT_PATH
+	if [[ -f "$0" ]]; then
+		cp "$0" "$VICINAE_SCRIPT_PATH"
+	else
+		curl -fsSL $SCRIPT_DOWNLOAD_URL > $VICINAE_SCRIPT_PATH
+	fi
 	chmod +x $VICINAE_SCRIPT_PATH
 }
 
@@ -621,8 +655,22 @@ main() {
 	
 	# Parse arguments
 	local action=""
+	local local_appimage=""
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
+		--appimage)
+			if [[ -z "${2:-}" ]]; then
+				echo "Error: --appimage requires a path argument"
+				show_usage
+				exit 1
+			fi
+			if [[ ! -f "$2" ]]; then
+				echo "Error: AppImage not found at $2"
+				exit 1
+			fi
+			local_appimage=$(readlink -f "$2")
+			shift 2
+			;;
 		--prefix)
 			if [[ -z "${2:-}" ]]; then
 				echo "Error: --prefix requires a path argument"
@@ -635,7 +683,16 @@ main() {
 			BIN_DIR="$PREFIX/bin"
 			THEMES_DIR="$PREFIX/share/vicinae/themes"
 			APPLICATIONS_DIR="$PREFIX/share/applications"
-			SYSTEMD_USER_DIR="$PREFIX/lib/systemd/user"
+			SYSTEMD_USER_DIR="$(resolve_systemd_user_dir)"
+			shift 2
+			;;
+		--token)
+			if [[ -z "${2:-}" ]]; then
+				echo "Error: --token requires a GitHub token argument"
+				show_usage
+				exit 1
+			fi
+			export GITHUB_TOKEN="$2"
 			shift 2
 			;;
 		--uninstall)
@@ -665,74 +722,90 @@ main() {
 	check_dependencies
 	check_permissions
 
-	local release_info
-	release_info=$(get_latest_release_info)
-
+	local appimage_path
 	local latest_version
-	local appimage_name
-	IFS='|' read -r latest_version appimage_name <<<"$release_info"
 
-	local installed_version
-	installed_version=$(get_installed_version)
+	if [[ -n "$local_appimage" ]]; then
+		appimage_path="$local_appimage"
+		latest_version="(local)"
+		# artifact zips downloaded from CI do not preserve the executable bit
+		chmod +x "$appimage_path" 2>/dev/null || true
+		echo "Installing from local AppImage: $appimage_path"
+	else
+		local release_info
+		release_info=$(get_latest_release_info)
 
-	echo
-	echo "  Installed version: $installed_version"
-	echo "  Latest version:    $latest_version"
-	echo
+		local appimage_name
+		IFS='|' read -r latest_version appimage_name <<<"$release_info"
 
-	# Check if update is needed
-	if compare_versions "$installed_version" "$latest_version"; then
+		local installed_version
+		installed_version=$(get_installed_version)
+
+		echo
+		echo "  Installed version: $installed_version"
+		echo "  Latest version:    $latest_version"
+		echo
+
+		if ! compare_versions "$installed_version" "$latest_version"; then
+			if [[ -n "$(find "$INSTALL_DIR" -type d ! -perm -o=rx -print -quit 2>/dev/null)" ]]; then
+				fix_permissions "$INSTALL_DIR"
+				ok "Repaired permissions in $INSTALL_DIR"
+			fi
+			ok "Vicinae is already up to date"
+			return 0
+		fi
+
 		if [[ "$installed_version" == "none" ]]; then
 			echo "Installing Vicinae for the first time..."
 		else
 			echo "Updating Vicinae from $installed_version to $latest_version..."
 		fi
 
-		local appimage_path
 		appimage_path=$(download_appimage "$latest_version" "$appimage_name")
-
-		echo $appimage_path
-
-		local extract_dir
-		extract_dir=$(extract_appimage "$appimage_path")
-
-		install_vicinae "$extract_dir" "$appimage_path"
-
-		if (( ${#WARNINGS[@]} > 0 )); then
-			echo 
-			echo -e "\033[1;33mInstallation completed with ${#WARNINGS[@]} warning(s):\033[0m"
-			for w in "${WARNINGS[@]}"; do
-				echo "  • $w"
-			done
-		fi
-
-		echo 
-		echo "🎉 Vicinae $latest_version has been successfully installed!"
-		echo 
-
-		# Check if binary directory is in PATH
-		if [[ ":$PATH:" == *":$BIN_DIR:"* ]]; then
-			ok "$BIN_DIR is already in your PATH. You can now run 'vicinae' from anywhere in your terminal."
-		else
-			echo "To use Vicinae, add $BIN_DIR to your PATH:"
-			if [[ "$BIN_DIR" == "$HOME"* ]]; then
-				# User installation - show unexpanded path
-				local_path="${BIN_DIR/#$HOME/\$HOME}"
-				echo "  export PATH=\"$local_path:\$PATH\""
-			else
-				# System installation
-				echo "  export PATH=\"$BIN_DIR:\$PATH\""
-			fi
-			echo ""
-			echo "You can add this to your shell profile (~/.bashrc, ~/.zshrc, etc.) for permanent access."
-			echo "Then restart your terminal or run the export command above."
-		fi
-
-		echo ""
-		echo "Check the quickstart section for your Desktop Environment at https://docs.vicinae.com"
-	else
-		ok "Vicinae is already up to date"
 	fi
+
+	# local AppImages are never deleted, only downloaded ones are cleaned up
+	local extract_dir
+	if [[ -n "$local_appimage" ]]; then
+		extract_dir=$(extract_appimage "$appimage_path" keep)
+		install_vicinae "$extract_dir"
+	else
+		extract_dir=$(extract_appimage "$appimage_path")
+		install_vicinae "$extract_dir" "$appimage_path"
+	fi
+
+	if (( ${#WARNINGS[@]} > 0 )); then
+		echo
+		echo -e "\033[1;33mInstallation completed with ${#WARNINGS[@]} warning(s):\033[0m"
+		for w in "${WARNINGS[@]}"; do
+			echo "  • $w"
+		done
+	fi
+
+	echo
+	echo "🎉 Vicinae $latest_version has been successfully installed!"
+	echo
+
+	# Check if binary directory is in PATH
+	if [[ ":$PATH:" == *":$BIN_DIR:"* ]]; then
+		ok "$BIN_DIR is already in your PATH. You can now run 'vicinae' from anywhere in your terminal."
+	else
+		echo "To use Vicinae, add $BIN_DIR to your PATH:"
+		if [[ "$BIN_DIR" == "$HOME"* ]]; then
+			# User installation - show unexpanded path
+			local_path="${BIN_DIR/#$HOME/\$HOME}"
+			echo "  export PATH=\"$local_path:\$PATH\""
+		else
+			# System installation
+			echo "  export PATH=\"$BIN_DIR:\$PATH\""
+		fi
+		echo ""
+		echo "You can add this to your shell profile (~/.bashrc, ~/.zshrc, etc.) for permanent access."
+		echo "Then restart your terminal or run the export command above."
+	fi
+
+	echo ""
+	echo "Check the quickstart section for your Desktop Environment at https://docs.vicinae.com"
 }
 
 main "$@"
